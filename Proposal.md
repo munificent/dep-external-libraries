@@ -16,7 +16,6 @@ full detail. Rest assured that the detail will come.**
 
 A user can create a library with a configuration-independent public API but
 whose contents are partially defined in separate configuration-specific files.
-
 This gives you the ability to write code that takes advantages of features only
 available a single configuration, where "configuration" means something like
 "dart2js", "the standalone VM", etc.
@@ -27,8 +26,8 @@ when *editing* code, the user just sees it as a single library. When *running*
 it, the correct code is patched in for the configuration that the program is
 running in.
 
-**TL;DR: Take the "patch file" concept we already use in the core libraries and
-make something similar that users can also use.**
+*TL;DR: Take the "patch file" concept we already use in the core libraries and
+make something similar that users can also use.*
 
 ## Motivation
 
@@ -71,23 +70,22 @@ touching the unsupported library at *runtime*, the mere presence of the
 
 ### Patch files
 
-Interesting, the core libraries themselves have this problem. "dart:core" needs
-to eventually bottom out at C++ code in the native VM, and in snippets of JS in
-dart2js. So while there is a single "canonical" "dart:core" that defines its
-*static API*, much of its *implementation* is delegated to platform-specific
-machinery.
+Interestingly, the core libraries themselves also have this problem.
+"dart:core" needs to eventually bottom out at C++ code in the native VM, and in
+snippets of JS in dart2js. So while there is a single "canonical" "dart:core"
+that defines its *static API*, much of its *implementation* is delegated to
+platform-specific machinery.
 
 This machinery is called "patch files", and is not part of the language spec.
-What *is* in the language spec is *external methods*. These are declarations of
-methods whose definitions are left up to the implementation to provide.
+What *is* in the language spec is *external functions*. These are declarations
+of functions whose definitions are left up to the implementation to provide.
 
-This proposal is about turning this idea into something that end users can also
-use.
+This proposal is turns these into something end users can also use.
 
 ## Examples
 
-We'll start simple. Let's say you want to write a library for showing warnings
-to the user. It exposes a single function:
+We'll start simple. Say you want to write a library for showing warnings to the
+user. It exposes a single function:
 
 ```dart
 void warn(String message) {
@@ -95,11 +93,10 @@ void warn(String message) {
 }
 ```
 
-You want this library to be usable on every Dart platform. Moreso, it's
+You want this library to be usable on every Dart platform. Moreso, its
 behavior should be *tailored* to the platform it's running on. On the browser,
 it should show a warning by adding some elements to the DOM. On the standalone
-VM, it should print to stderr. Just in case there's some bizarro Dart platform
-that supports neither, you'll just fall back to good old `print()`.
+VM, it should print to stderr.
 
 Using this proposal, you would write:
 
@@ -131,11 +128,7 @@ and:
 import 'dart:io';
 
 void warn(String message) {
-  if (const bool.fromEnvironment("dart.html")) {
-    html.document.body.appendHtml('<div class="warn">$message</div>');
-  } else if (const bool.fromEnvironment("dart.io")) {
-    io.stderr.writeLine(message);
-  }
+  io.stderr.writeLine(message);
 }
 ```
 
@@ -165,11 +158,9 @@ public API it defines.
 
 ### A cross-platform HTTP client
 
-Let's walk through a simple example. We'll sketch out very roughly how the http
-package could use this.
-
-It's canonical library defines a `Client` class for performing HTTP requests.
-This is the platform-independent public API of the package:
+Here's another example. We'll sketch out very roughly how the http package
+could use this. Its canonical library defines a `Client` class for performing
+HTTP requests. This is the platform-independent public API of the package:
 
 ```dart
 // http.dart
@@ -231,10 +222,10 @@ about how this actually works.
 
 ## Proposal
 
-### Runtime behavior
-
 **TODO: I will specify this more precisely over time. Yes, I know it's
 hand-wavey.**
+
+### Runtime behavior
 
 To process a library using this feature, an implementation:
 
@@ -243,7 +234,7 @@ To process a library using this feature, an implementation:
     libraries matching.)*
 
 2.  The canonical library and external library's bodies are "compiled" (i.e.
-    names resolved, etc. in their own scopes). In other words, the canonical
+    names resolved, etc.) in their own scopes. In other words, the canonical
     library and external library may have different imports from each other and
     the two don't interfere.
 
@@ -274,6 +265,9 @@ To process a library using this feature, an implementation:
 
     This produces two namespaces, the canonical and external one.
 
+    Note that this happens *after* step 1. This ensures that a runtime never
+    sees an import for a core library it doesn't support.
+
 3.  Every top-level name in the canonical library not already used in the
     external library is added to the external library.
 
@@ -302,7 +296,7 @@ To process a library using this feature, an implementation:
     }
     ```
 
- *  When two classes overlap, their namespaces are handled the same way: all
+4.  When two classes overlap, their namespaces are handled the same way: all
     members of the canonical class not present in the external one are added.
 
     For example:
@@ -337,21 +331,21 @@ To process a library using this feature, an implementation:
     *TODO: Decide how the canonical class's superinterfaces, superclass, and
     mixins are handled.**
 
- *  The result of this then becomes the namespace of the that all other code
+5.  The result of this then becomes the namespace of the that all other code
     sees.
 
 ### Static analysis
 
-A key feature of this proposal is that it's static analysis story is very
+A key feature of this proposal is that its static analysis story is very
 simple. IDEs, analyzers and other tools only look at the canonical library and
-that forms the "official" public static API of the library.
+that defines the "official" static API of the library.
 
 This gives the user a simpler IDE experience&mdash;they can navigate around in
 their program without having think about what "configuration" their program is
 in.
 
 At the same time, a sophisticated analyzer may want to add some additional
-hinting beyond that. For example, if would helpful for the *implementer* of a
+hinting beyond that. For example, it would helpful for the *implementer* of a
 cross-platform library to know if they forgot to provide a definition for some
 `external` function, or it the signature of one they provided doesn't match its
 declaration.
@@ -360,7 +354,7 @@ declaration.
 
 There have been a large number of attempts at solutions in this problem space
 over the years. The current other active proposal is Lasse's [configured
-imports DEP][]
+imports DEP][].
 
 [configured imports dep]: https://github.com/lrhn/dep-configured-imports
 
