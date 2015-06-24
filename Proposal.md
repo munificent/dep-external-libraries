@@ -1,9 +1,5 @@
 # External libraries
 
-**Note: This proposal is still in a really rough strawman shape. I wanted to
-get enough written to start talking about it but didn't have time to go into
-full detail. Rest assured that the detail will come.**
-
 * Author: [Bob Nystrom][bob] ([rnystrom@google.com][email])
 * Repository: https://github.com/munificent/dep-external-libraries
 * Stakeholders: [Lasse][]
@@ -12,186 +8,265 @@ full detail. Rest assured that the detail will come.**
 [email]: mailto:rnystrom@google.com
 [lasse]: https://github.com/lrhn
 
-## Summary
-
-A user can create a library with a configuration-independent public API but
-whose contents are partially defined in separate configuration-specific files.
-This gives you the ability to write code that takes advantages of features only
-available a single configuration, where "configuration" means something like
-"dart2js", "the standalone VM", etc.
-
-At the same time, the library defines a single canonical static structure that
-can be used to provide a unified analysis and IDE experience. In other words,
-when *editing* code, the user just sees it as a single library. When *running*
-it, the correct code is patched in for the configuration that the program is
-running in.
-
-*TL;DR: Take the "patch file" concept we already use in the core libraries and
-make something similar that users can also use.*
-
 ## Motivation
 
-From its inception, Dart has run on top of multiple different "platforms": the
-native VM running on the console, Dartium, compiled to JavaScript, etc. These
-implementations vary in their capabilities, which is why some core libraries
-like "dart:io" and "dart:html" are only allowed on certain platforms. As we
-move into ever-more-diverse mobile platforms, this problem will magnify. We may
-find ourselves with "dart:android", "dart:ios", etc.
+The Dart language does not exist in a vacuum:
+
+ *  An application may run on both the standalone VM where it has access to
+    "dart:io" and a browser where it can use "dart:html".
+
+ *  An application may be compiled to JavaScript and use the JS DOM.
+
+ *  A core library type like String may be implemented partially or completely
+    in C++ in the native VM. Meanwhile, that same class may be implemented in
+    JavaScript when compiled with dart2js.
+
+ *  A custom embedder like [Sky][] may want to expose new behavior written in
+    C++ to end user Dart programs.
+
+[sky]: https://github.com/domokit/mojo/tree/master/sky
+
+In all of these cases, the user's code reaches out towards some functionality
+that may not be available or even comprehensible by every tool in the Dart
+platform.
+
+Since we have focused mostly on building a platform-independent Dart world, we
+haven't built a robust system for code that cares about where it's running.
+Instead, we've grown a handful of ad-hoc solutions:
+
+ 1. Our core libraries are partially platform independent and partially
+    platform (i.e. VM or dart2js) specific. For each core library, there is a
+    "main" platform independent library. That library declares some methods as
+    `external` to indicate that the implementation is platform-specific.
+
+ 2. Then, there is a "patch" Dart file for each platform. This uses a `@patch`
+    annotation or `patch` keyword to mark a class or method as providing
+    implementations for some of the external methods in the main library.
+
+ 3. In the VM's patch file, some methods are in turn declared `native` followed
+    by a string literal. This marks the method as being implemented by a native
+    C++ method that can be located by the VM using the given string name.
+
+ 4. In the patch file for dart2js, `native` is used in a similar way but
+    without a string literal. Instead native methods have a few metadata
+    annotations describing how they interact with the underlying JS DOM.
+
+ 5. dart2js also defines some methods whose implementation is a chunk of inline
+    JavaScript. This is done by having the method body call a `JS()` function
+    whose argument is the string of JavaScript code.
+
+Aside from the `external` keyword, none of these features are specified or
+officially supported by the Dart platform. Many of them are only enabled inside
+"dart:" libraries, and the set of those is in turn [hardcoded in the
+SDK][hard].
+
+[hard]: https://github.com/dart-lang/sdk/blob/master/sdk/lib/_internal/libraries.dart
+
+This means that when external Dart users run into these problems, they don't
+have the solutions we've given ourselves. This proposal solves that by
+cleaning up and rationalizing these existing features into a simple system that
+is both powerful enough for us to replace our old ad-hoc solutions and useful
+enough to specify and give to end users.
+
+## Summary
+
+**A pure Dart library declares a static API. It omits some of its
+implementation by declaring functions `external`. These are then provided by
+either another Dart library, or through some other mechanism outside of the
+core Dart platform.**
+
+This gives a Dart implementation&mdash;VM, compiler, custom embedder,
+etc.&mdash;the power to add capabilities to Dart. Meanwhile, the static
+analysis story (type checking, IDE navigation, etc.) remains full-featured and
+usable. Since there is always a *static declaration* of the library's API
+written in standard Dart code, tools always have a coherent view of the
+program.
+
+We then build on top of this core concept by specifying a couple of different
+concrete ways an implementation of one of these declared libraries may be wired
+in:
+
+ *  The implementation may simply be a separate hard-coded normal Dart library.
+
+ *  The implementation may be one of a handful of configuration-specific Dart
+    libraries chosen at runtime or compile time by a Dart implementation.
+
+ *  The implementation may be handled entirely outside of the platform by a
+    custom embedder or compiler-specific features.
+
+## Examples
+
+We'll walk through a progression of use cases to incrementally build all of the
+features of the proposal.
+
+### Example 1: Weaving in generated code
+
+Say you are building a serialization system. Given some hand-authored class,
+you'd like to be able to automatically serialize it to and from JSON. You, of
+course, want to do this efficiently with small dart2js output. That means
+avoiding mirrors.
+
+One easy way to do this is using offline code generation. You can use the
+[source_gen][] package to create a little code generator. It parses your
+hand-authored class to find its fields and outputs a blob of Dart code to
+convert objects to and from JSON.
+
+[source_gen]: https://github.com/dart-lang/source_gen
+
+The question is, where do we put this blob of code? Ideally, it would go in a
+separate file. Mixing hand-maintained and generated code in the same file
+causes user pain and usually breaks the code generator. However, we'd really
+like the serialization API to hang off the hand-authored class. Given:
+
+```dart
+class Person extends {
+  final String name;
+  final int age;
+
+  Person(this.name, this.age);
+}
+```
+
+We want other code to be able to do:
+
+```dart
+Person roundtrip(Person person) {
+  var json = person.toJson();
+  return new Person.fromJson(json);
+}
+```
+
+How can we have `toJson()` and `Person.fromJson()` be *declared* in the
+hand-authored library but *implemented* in another file? Like so:
+
+```dart
+external library 'person.g.dart';
+
+class Person extends {
+  final String name;
+  final int age;
+
+  Person(this.name, this.age);
+
+  external Person.fromJson(Map json);
+
+  external Map toJson();
+}
+```
+
+There are a few pieces here:
+
+**1. Canonical library**
+
+We'll call the hand-authored library here the *canonical* library. A canonical
+library is the starting point for this whole proposal.
+
+**2. External members**
+
+A member or function can be declared `external` to delegate its implementation
+elsewhere. This is exactly how the language already specifies `external`, so
+we're just using that existing feature. It says, "at runtime, this member will
+exist *somehow* so statically just pretend it already does".
+
+Since the declaration is in pure Dart code and has a full type signature, the
+analyzer and all of our static analysis tools can treat it as it if were fully
+present.
+
+**3. External libraries**
+
+Now we provide the first mechanism to define what "elsewhere" means. The
+`external library` directive declares a second Dart *external library* that is
+used to provide the implementations of the `external` methods in the current
+library.
+
+It specifies the actual URL of the external library so that starting from the
+canonical library, we can find its external library. Here, it would look
+something like:
+
+```dart
+external library for 'person.dart';
+
+import 'dart:convert';
+
+class Person {
+  factory Person.fromJson(Map json) => new Person(json["name"], json["age"]);
+  Map toJson() => {"name": name, "age": age};
+}
+```
+
+At static analysis time, the `external library for ...` directive lets the
+analyzer know what canonical library this library is patching. This is
+important for understanding the namespace of the methods inside `Person` here.
+Notice how they refer to `name` and `age` even though `Person` in this library
+doesn't define them? That works because analysis knows this `Person` is really
+patching the "real" `Person` class defined in the canonical library.
+
+At runtime, the method bodies for `fromJson()` and `toJson()` are slotted into
+the "real" `Person` class as if they were defined right there.
+
+### Example 2: Configuration-specific libraries
+
+Dart runs on multiple "platforms": the native VM running on the console,
+Dartium, compiled to JavaScript, etc. These implementations vary in their
+capabilities, which is why some core libraries like "dart:io" and "dart:html"
+are only supported on certain platforms.
 
 Often, different platforms *do* have the same capability, just exposed through
-a different API. You can do HTTP and WebSockets in the browser and on the
-command-line, but you can't do them using the same API.
+differently. For example, the [http][] package would like to make HTTP requests
+using "dart:io"'s [`HttpClient`][io client] class when run on the command-line
+and using an [`HttpRequest`][html request] on the browser.
 
-Users want to write platform-independent libraries that hide these differences,
-but can't. It's impossible to write a cross-platform library if it needs to
-touch anything platform-specific. If your library imports "dart:html", it fails
-*at compile time* on the standalone VM. You never get to `main()`.
-
-This is a *transitive* property. If your application imports a package that
-imports some other package that imports a library that ultimately imports
-"dart:io", you can never ever run your application on a browser *even if it
-never accesses "dart:io" at runtime.*
-
-For example, the [unittest][] package would like to report test failures on a
-browser by adding elements to the DOM. On the standalone VM, it would like to
-write to stderr. Likewise, the [http][] package would like to make HTTP
-requests using "dart:io"'s [`HttpClient`][io client] class when used on the
-command-line while using an [`HttpRequest`][html request] on the browser.
-
-[unittest]: https://pub.dartlang.org/packages/unittest
 [http]: https://pub.dartlang.org/packages/http
 [io client]: https://api.dartlang.org/apidocs/channels/stable/dartdoc-viewer/dart:io.HttpClient
 [html request]: https://api.dartlang.org/apidocs/channels/stable/dartdoc-viewer/dart:html.HttpRequest
 
-There's currently no way to write a single library that can span these
-platforms and use the right library where appropriate. Even if it can avoid
-touching the unsupported library at *runtime*, the mere presence of the
-`import` prevents the program from running at all.
-
-### Patch files
-
-Interestingly, the core libraries themselves also have this problem.
-"dart:core" needs to eventually bottom out at C++ code in the native VM, and in
-snippets of JS in dart2js. So while there is a single "canonical" "dart:core"
-that defines its *static API*, much of its *implementation* is delegated to
-platform-specific machinery.
-
-This machinery is called "patch files", and is not part of the language spec.
-What *is* in the language spec is *external functions*. These are declarations
-of functions whose definitions are left up to the implementation to provide.
-
-This proposal is turns these into something end users can also use.
-
-## Examples
-
-We'll start simple. Say you want to write a library for showing warnings to the
-user. It exposes a single function:
-
-```dart
-void warn(String message) {
-  ...
-}
-```
-
-You want this library to be usable on every Dart platform. Moreso, its
-behavior should be *tailored* to the platform it's running on. On the browser,
-it should show a warning by adding some elements to the DOM. On the standalone
-VM, it should print to stderr.
-
-Using this proposal, you would write:
-
-```dart
-// warn.dart
-external library 'warn_browser.dart' for dart.html;
-external library 'warn_console.dart' for dart.io;
-
-/// Warns the user about [message].
-external void warn(String message);
-```
-
-We'll call this the *canonical library*. It in turn refers to two separate
-*external libraries*:
-
-```dart
-// warn_browser.dart
-import 'dart:html';
-
-void warn(String message) {
-  html.document.body.appendHtml('<div class="warn">$message</div>');
-}
-```
-
-and:
-
-```dart
-// warn_console.dart
-import 'dart:io';
-
-void warn(String message) {
-  io.stderr.writeLine(message);
-}
-```
-
-This "warn.dart" library can be used like any normal Dart library:
-
-```dart
-// main.dart
-import 'warn.dart';
-
-void main() {
-  warn("This proposal is still in progress!");
-}
-```
-
-When the program is run, an external library is selected that matches the host
-platform. For example, if the user runs this on the standalone VM,
-'warn_console.dart' is selected. The VM reads that library. It finds the
-concrete definition of `warn()` and patches it in where the `external` one was
-declared in "warn.dart".
-
-Likewise, if a user runs this in Dartium or compiles it with dart2js, the
-browser version is inserted instead.
-
-When the user is just editing their code in their favorite IDE of choice, the
-external libraries are ignored. She just sees a single "warn.dart" and the
-public API it defines.
-
-### A cross-platform HTTP client
-
-Here's another example. We'll sketch out very roughly how the http package
-could use this. Its canonical library defines a `Client` class for performing
-HTTP requests. This is the platform-independent public API of the package:
+Alas, you can't write a single library that works across platforms because it
+is a *compile error* to import a "dart:" library on an unsupported platform.
+We'll fix that with a layer of indirection:
 
 ```dart
 // http.dart
-
-external library 'io_client.dart' for dart.io;
-external library 'browser_client.dart' for dart.html;
+external library
+    if (dart.io) 'io_client.dart'
+    if (dart.html) 'browser_client.dart';
 
 abstract class Client {
   external Client();
 
-  /// Sends an HTTP GET request with the given headers to the given URL, which
-  /// can be a [Uri] or a [String].
   external Future<Response> get(url, {Map<String, String> headers});
 
-  /// Sends an HTTP POST request with the given headers and body to the given
-  /// URL, which can be a [Uri] or a [String].
   external Future<Response> post(url, {Map<String, String> headers, body,
       Encoding encoding});
-
-  // More code...
 }
 ```
 
-Note that even its constructor is external. This class may also contain real
-implementation code for behavior that is already platform-independent. It
-doesn't have to be a pure interface.
-
-Then there are the two external libraries:
+Like the above example, we have a canonical library that declares the
+platform-independent API. The implementation is pushed into an external
+library. The difference here is the `if` clauses:
 
 ```dart
-// io_client.dart
+external library
+    if (dart.io) 'io_client.dart'
+    if (dart.html) 'browser_client.dart';
+```
+
+**4. Configured libraries**
+
+An external library directive may have one or more `if` clauses instead of a
+straight URI. Each contains a constant expression and a URI. At runtime, that
+expression is evaluated in a namespace based on [environment constants][env].
+If it evaluates to `true` then that clause's URI is the external library that
+gets patched in at runtime.
+
+[env]: http://blog.sethladd.com/2013/12/compile-time-dead-code-elimination-with.html
+
+**5. Configuration-specific libraries**
+
+Now we get to the external library for a specific configuration. In our
+example, for the standalone VM, it would look something like this:
+
+```dart
+external library for 'http.dart';
 
 import 'dart:io';
 
@@ -213,161 +288,421 @@ class Client extends BaseClient {
       Encoding encoding}) {
     // Use dart:io...
   }
-
 }
 ```
 
-The browser one is similar. You get the idea. Now we'll get into the details
-about how this actually works.
+The important part is that we've removed the import of "dart:io" out of the
+ *canonical* library and into the *external* library. On the standalone VM, we
+ pick the above configuration. The standalone VM does support "dart:io" so
+ everything works as expected.
+
+On a browser, this external library is never selected. Instead, the
+browser-specific one that does not import "dart:io" gets picked.
+
+This lets a user ensure an implementation never sees a import of a "dart:"
+library that it doesn't support. Since an external library can contain imports, it *lets the user control which imports are seen*.
+
+### Example 3: Native methods in a custom embedder
+
+Finally, we get to what may be the most interesting example. The [Sky][] team
+is working on a new platform for mobile applications. They are using Dart as
+the platform's scripting language. Since they operate near the OS level, they
+have new low-level capabilities that they need to expose directly to
+Dart&mdash;capabilities unique to the Sky platform.
+
+The Dart VM has always been designed to be embeddable in host applications like
+other scripting languages. Part of this means being able to call into native
+C++ code from Dart. Currently, the VM supports this using a `native` keyword,
+like:
+
+```dart
+class List {
+  int get length native "List_getLength";
+}
+```
+
+There is one limitation: `native` can only be used inside "dart:" libraries.
+The Sky folks *could* create their own new "dart:sky" library and let users do:
+
+```dart
+import "dart:sky";
+```
+
+At runtime, all of the new capabilities would be available. Great!
+
+But, when a user opens that program in their IDE of choice, the user experience
+is *not* great. Because "dart:sky" is bundled up inside Sky's custom embedder,
+the analyzer has no idea what it declares or how to find it. Any references to
+names imported from "dart:sky" become static errors.
+
+We can solve this by adding two more small features to this proposal:
+
+**6. External strings**
+
+One reason the VM uses `native` instead of `external` is that it allows a
+string literal to follow the keyword. The VM uses this to look up the proper
+C++ method to bind. It could use a metadata annotation instead:
+
+```dart
+class List {
+  @Native("List_getLength")
+  external int get length;
+}
+```
+
+But I believe the VM wants to avoid parsing metadata annotations during
+startup. If this is still a concern, we can extend the specification of
+`external` to allow an optional string literal after the declaration:
+
+```dart
+class _List<E> extends FixedLengthListBase<E> {
+  external int get length "List_getLength";
+}
+```
+
+This gets us to a syntax closer to what is already specified in the language
+and equally as expressive as `native`.
+
+**7. Implementation-defined behavior**
+
+The last "feature" isn't really a feature at all since it's what the language
+already specifies. So far, all of the external methods we've seen have been
+patched using implementations in Dart. That's fine when an external library for
+that configuration is available.
+
+If it's not, a Dart implementation can handle that how it chooses. In the case
+of the VM, that means handing it off to the custom embedder. The Sky team can
+define a canonical library like so:
+
+```dart
+class InternetAddress {
+  external static Uint8List parse(String address) "InternetAddress_Parse";
+
+  // Other stuff...
+}
+```
+
+They put this library *in the Sky package* that gets published to pub or
+however else they want to get it into users hands. A user uses it like so:
+
+```dart
+import 'package:sky/sky.dart';
+
+main() {
+  InternetAddress.parse("localhost");
+}
+```
+
+In their IDE, everything works fine. This is now a regular "package:" import
+that the analyzer can traverse. Since the canonical library in the package has
+the declarations for `InternetAddress` and `parse()`, all of the static
+analysis users know and love works.
+
+When the user runs the program in the custom Sky embedder, the VM tells the
+embedder, "The library with URL 'package:sky/sky.dart' has an external method
+'InternetAddress_Parse'. What do I bind it to?" The embedder provides a C++
+method and it gets wired up appropriately like it is today.
 
 ## Proposal
 
-**TODO: I will specify this more precisely over time. Yes, I know it's
-hand-wavey.**
+Those examples covered all of the moving parts. Before we get into the details,
+here's a quick summary:
 
-### Runtime behavior
+ *  A function or member in a *canonical library* can be marked `external`.
+    That declares it statically for tooling but delegates the implementation to
+    elsewhere.
 
-To process a library using this feature, an implementation:
+ *  The "elsewhere" can be an *external library* that is referenced by the
+    canonical library. This Dart library provides concrete implementations of
+    the external methods that get *patched* into the canonical library.
 
-1.  Determines which external library should be chosen for the current
-    implementation. *(TODO: Decide how to handle multiple or no external
-    libraries matching.)*
+ *  A canonical library may use *if clauses* to link to multiple external
+    libraries and the right one is chosen based on the configuration.
 
-2.  The canonical library and external library's bodies are "compiled" (i.e.
-    names resolved, etc.) in their own scopes. In other words, the canonical
-    library and external library may have different imports from each other and
-    the two don't interfere.
+ *  An external library may have its own imports that are specific to a
+    configuration.
 
-    For example:
+ *  An external method may have an optional string literal that can be used by
+    an implementation as it sees fit.
 
-    ```dart
-    // canonical.dart
-    external library 'external.dart' for true;
+ *  If an external method isn't implemented by an external library, the host
+    implementation can handle it how it wants.
 
-    import 'foo.dart' show someName;
+Now we can get into the details of how these could work. This is still fairly
+open-ended. My goal is to be able to subsume the existing uses of `native` and
+patch files but I don't know all of the gory details of how those work yet. If
+you do, please do help me refine this such that we can cover all of the
+existing uses.
 
-    main() {
-      print(someName); // "foo"
-    }
+### Declaring external functions
 
-    external inExternal();
-    ```
+We extend the grammar to allow a string literal at the end of an external
+function declaration. Replace the existing spec for **declaration** with:
 
-    ```dart
-    // external.dart
+**declaration:**<br>
+&emsp;&emsp;memberDeclaration |<br>
+&emsp;&emsp;`external` memberDeclaration plainString?<br>
+&emsp;&emsp;fieldDeclaration<br>
+&emsp;&emsp;;
 
-    import 'bar.dart' show someName;
+**memberDeclaration:**<br>
+&emsp;&emsp;constantConstructorSignature (redirection | initializers)? |<br>
+&emsp;&emsp;constructorSignature (redirection | initializers)? |<br>
+&emsp;&emsp;`static`? getterSignature |<br>
+&emsp;&emsp;`static`? setterSignature |<br>
+&emsp;&emsp;operatorSignature |<br>
+&emsp;&emsp;`static`? functionSignature |<br>
+&emsp;&emsp;;
 
-    inExternal() {
-      print(someName); // "bar"
-    }
-    ```
+**fieldDeclaration:**<br>
+&emsp;&emsp;`static` (`final` | `const`) type? staticFinalDeclarationList |<br>
+&emsp;&emsp;`final` type? initializedIdentifierList |<br>
+&emsp;&emsp;`static`? (`var` | type) initializedIdentifierList<br>
+&emsp;&emsp;;
 
-    This produces two namespaces, the canonical and external one.
+I'm guessing we don't want to allow interpolation inside the string literal,
+but we also don't want to require `r` before the string, which leads to:
 
-    Note that this happens *after* step 1. This ensures that a runtime never
-    sees an import for a core library it doesn't support.
+**plainString:**<br>
+&emsp;&emsp;`'` (~(`'` | NEWLINE))* `'` |<br>
+&emsp;&emsp;`"` (~(`"` | NEWLINE))* `"`<br>
+&emsp;&emsp;;
 
-3.  Every top-level name in the canonical library not already used in the
-    external library is added to the external library.
+And we can reuse that in **singleLineString**:
 
-    For example:
+**singleLineString:**<br>
+&emsp;&emsp;`"` stringContentDQ* `"` |<br>
+&emsp;&emsp;`'` stringContentSQ* `'` |<br>
+&emsp;&emsp;`r` plainString<br>
+&emsp;&emsp;;
 
-    ```dart
-    // canonical.dart
-    external library 'external.dart' for true;
+The `native` keyword is also used before classes to indicate that the class
+itself has some custom implementation-specific backing storage or
+implementation. To support that, we may also want to allow the `external`
+keyword before a class:
 
-    var a = "canonical";
-    var b = "canonical";
+**classDefinition:**<br>
+&emsp;&emsp;metadata (`abstract`|`external`)? `class` identifier typeParameters? (superclass mixins?)? interfaces?<br>
+&emsp;&emsp;`{` (metadata classMemberDefinition)* `}` |<br>
+&emsp;&emsp;metadata `abstract`? `class` mixinApplicationClass<br>
+&emsp;&emsp;;<br>
 
-    main() {
-      accessVars();
-    }
-    ```
+### Linking to external libraries
 
-    ```dart
-    // external.dart
+A canonical library can wire itself up with zero or more external libraries
+using an external library directive:
 
-    b = "external";
+**libraryDefinition:**<br>
+&emsp;&emsp;scriptTag? libraryName? (externalLibrary|externalForLibrary)? importOrExport\* partDirective\* topLevelDefinition*<br>
+&emsp;&emsp;;
 
-    accessVars() {
-      print(a); // "canonical"
-      print(b); // "external"
-    }
-    ```
+**externalLibrary:**<br>
+&emsp;&emsp;`external` `library` (uri | externalConditions)`;`<br>
+&emsp;&emsp;;
 
-4.  When two classes overlap, their namespaces are handled the same way: all
-    members of the canonical class not present in the external one are added.
+If a *uri* is given, than that library is always chosen. Otherwise, one or more
+conditional external libraries may be configured:
 
-    For example:
+**externalConditions:**<br>
+&emsp;&emsp;(`if` `(` expression `)` uri)+ (`else` uri)?<br>
+&emsp;&emsp;;
 
-    ```dart
-    // canonical.dart
-    external library 'external.dart' for true;
+*Note: I'm not strongly attached to this syntax. Break out your paint for the
+bikeshed.*
 
-    class Foo {
-      a() => "canonical";
-      b() => "canonical";
+Each *expression* must be a constant expression. They are evaluated essentially
+the same as in [Lasse's configured imports proposal][config].
 
-      callMethods() {
-        print(a()); // "canonical"
-        print(b()); // "external"
-      }
-    }
+[config]: https://github.com/lrhn/dep-configured-imports/blob/master/DEP-configured-imports.md#semantics
 
-    main() {
-      new Foo().callMethods();
-    }
-    ```
+*TODO: Specify this more precisely.*
 
-    ```dart
-    // external.dart
+The `if` clauses are evaluated in order. The first one that evaluates to `true`
+has its URI chosen as the external library. If no `if` clause matches, the
+`else` URI is used, if given. Otherwise, no external library is chosen and it
+falls onto the implementation to decide how to handle the unpatched `external`
+methods.
 
-    class Foo {
-      b() => "external";
-    }
-    ```
+(It is not required for a library to have an `external library` directive in
+order to declare `external` functions. This is useful for backwards compatibility and in cases where an `external` function is handled by the implementation and not an external library.)
 
-    *TODO: Decide how the canonical class's superinterfaces, superclass, and
-    mixins are handled.**
+This is the *only* way to reference an external library. It cannot be imported,
+exported, or parted.
 
-5.  The result of this then becomes the namespace of the that all other code
-    sees.
+### Defining an external library
 
-### Static analysis
+An external library is a library that contains an `external library for`
+directive:
 
-A key feature of this proposal is that its static analysis story is very
-simple. IDEs, analyzers and other tools only look at the canonical library and
-that defines the "official" static API of the library.
+**externalForLibrary:**<br>
+&emsp;&emsp;`external` `library` `for` uri`;`<br>
+&emsp;&emsp;;
 
-This gives the user a simpler IDE experience&mdash;they can navigate around in
-their program without having think about what "configuration" their program is
-in.
+If library A has an `external library` directive with a URI referencing library
+B, library B must have an `external library for` directive with a URI
+referencing library A.
 
-At the same time, a sophisticated analyzer may want to add some additional
-hinting beyond that. For example, it would helpful for the *implementer* of a
-cross-platform library to know if they forgot to provide a definition for some
-`external` function, or it the signature of one they provided doesn't match its
-declaration.
+It is a compile error to import, export, or part a library that contains an
+`external library for` directive.
+
+Having URIs pointing in both directions is technically redundant. However, it
+ensures that when starting static analysis from an external library, the tool
+can correctly find the canonical library it is associated with.
+
+### Merging an external library
+
+This is the most complex corner of this proposal, and likely the part that will
+need the most iteration. We need to decide how the external and canonical
+libraries interact. We also want to statically analyze both libraries and give
+the user early feedback if this process is unlikely to succeed.
+
+Note that configuration-specific libraries do not add any complexity. At static
+analysis time, we consider each external library independently. All that
+matters is its relationship to its canonical library. At runtime, only a single
+configuration will be chosen, so there is only a single canonical/external
+library pair to merge.
+
+The basic concepts are:
+
+ *  Both the canonical and external libraries retain their original lexical
+    scopes. Functions and members in each of those libraries are always
+    resolved in the lexical scope in which they appear.
+
+ *  For each patched class, *single* class is produced that contains the
+    members of both the canonical and external library and that class is bound
+    to its name in both libraries' namespaces. Explicit and implicit references
+    to `this` in members of that class always refer to this merged class.
+
+ *  Private names are considered part of the library's lexical scope. A merged
+    class may contain private members from both the canonical and external
+    library but members in each library each can only see their own private
+    names.
+
+Here's a more precise imperative specification of the process. Given a
+canonical library C ("canonical") and an external library E ("external"), here
+is what we do:
+
+1.  For every top-level `external` function in C:
+    1.  If a top-level function in E with the same name exists:
+        1.  If the name does not refer to a function, or the function's type
+            could not be a valid override for the type of the function in C,
+            warn.
+        2.  Replace the function in C with one that forwards to the function in
+            E.
+    2.  Else:
+        1.  Do nothing. (This falls back to the existing behavior to let the
+            platform inject an implementation.)
+2.  For every class T ("type") in C where there is a class P ("patch") in E
+    with the same name :
+    1.  For every `external` member in T:
+        1.  If a member with that name exists in P:
+            2.  If P's member could not be a valid override for T's, warn.
+            3.  Replace the member in T with the member in P. The body of the
+                member retains its original lexical scope in E, but resolves
+                `this` to be an instance of T.
+        2.  Else:
+            1.  Do nothing. (This falls back to the existing behavior to let
+                the platform inject an implementation.)
+        3.  Otherwise, the member in P is added to M.
+    2.  For every non-abstract member in P that we have not already handled:
+        1.  If a member with that name exists in T, warn.
+        2.  Add the member to T. The body of the member retains its original
+            lexical scope in E, but resolves `this` to be an instance of T.
+    3.  Replace P in E with T.
+
+### Static analysis of libraries containing `external`
+
+A library declaring `external` functions is analyzed like a normal library with
+any external functions acting like normal declarations.
+
+This is critical because it means the analyzer can work with libraries
+containing external functions even if those functions are implemented in some
+mechanism outside of the Dart platform. Since the external functions in the
+canonical library do have static type signatures, that's enough to analyze a
+program that calls them.
+
+You might think we could also include added class members from an external
+library when statically analyzing an canonical library. For example, given:
+
+```dart
+// canonical.dart
+external library 'external.dart';
+
+class C {}
+
+// external.dart
+external library for 'canonical.dart';
+
+class C {
+  added() { ... }
+}
+
+// main.dart
+main() {
+  new C().added(); // <-- Safe?
+}
+```
+
+You might not expect any static warnings. However, this doesn't work in the
+presence of multiple configuration-specific external libraries. One
+configuration may add some member that another configuration does not. To avoid
+that, only the members explicitly declared in the canonical library are
+statically visible from the canonical library.
+
+### Static analysis of an external library
+
+The story for external libraries is a little different. Since any external
+library only points to a *single* canonical library, we do know which members
+the merged class will have *in the context of the external library*. That means
+this should not have a static warning:
+
+```dart
+// canonical.dart
+external library 'external.dart';
+
+class C {
+  fromCanonical() { ... }
+}
+
+// external.dart
+external library for 'canonical.dart';
+
+class C {}
+
+test() {
+  new C().fromCanonical(); // <-- OK.
+}
+```
+
+When analyzing an external library, we replace any classes it defines with their merged versions.
 
 ## Alternatives
 
-There have been a large number of attempts at solutions in this problem space
-over the years. The current other active proposal is Lasse's [configured
-imports DEP][].
+The existing ad-hoc solutions for `native` functions and patch files are the
+main prior art here. They are less than an "alternative" than they are a
+starting point for this proposal. Basically, we take those and polish them up
+for end users.
+
+The nice thing about having these is that they form an existence proof of the
+workability of the proposal. If these features are powerful enough for our own
+core, IO, and HTML libraries, they are likely powerful enough for end users
+too.
+
+In addition, there have been a number of attempts at solutions to the
+"configuration-specific code" problem over the years. One other active proposal
+is Lasse's [configured imports DEP][].
 
 [configured imports dep]: https://github.com/lrhn/dep-configured-imports
 
-The fundamental difference between the proposals is how configuration affects
+One fundamental difference between the proposals is how configuration affects
 the *static* structure of the program. With this proposal, the external
-libraries are ignored by analysis and only the canonical library is analyzed.
-Lasse's proposal allows different configured imports to expose a different
-public API.
+libraries do not affect global analysis. This encapsulates
+configuration-specific differences within a single library. Lasse's proposal
+allows different configured imports to expose a different public API.
 
-This means analysis either has to try to "union" them together to provide a
-holistic view of all configurations simultaneously, or provide a way for a user
-to select which configuration they are currently looking at. In return for
-that, it can express some things this proposal cannot.
+This means analysis either has to try to do a multiway "union" of them to
+provide a holistic view of all configurations simultaneously, or require the
+user to select which configuration they are currently looking at.
 
 ## Implications and limitations
 
@@ -379,6 +714,8 @@ that, it can express some things this proposal cannot.
 
 ### Language specification changes
 
+**TODO!**
+
 ### A working implementation
 
 **TODO!**
@@ -387,12 +724,31 @@ that, it can express some things this proposal cannot.
 
 **TODO!**
 
+## Open questions
+
+*   Does an external library have to annotate which classes and methods are
+    patching things in the canonical library, or is name matching enough to
+    indicate that?
+
+*   How strict should we be about matching signatures for external functions
+    and their implementations? Use override semantics? Exact match?
+
+*   How strict should we be about member collisions in a patched class? An
+    error? Warning? If a warning, what are the runtime semantics?
+
+*   Will an external library need access to the canonical library's private
+    scope?
+
+*   Do we need to allow string literals on `external` methods or can we just
+    use metadata annotations in the VM like dart2js does?
+
 ## Patents rights
 
-TC52, the Ecma technical committee working on evolving the open [Dart standard][], operates under a royalty-free patent policy, [RFPP][] (PDF). This means if the proposal graduates to being sent to TC52, you will have to sign the Ecma TC52 [external contributer form][] and submit it to Ecma.
+TC52, the Ecma technical committee working on evolving the open [Dart
+standard][], operates under a royalty-free patent policy, [RFPP][] (PDF). This
+means if the proposal graduates to being sent to TC52, you will have to sign
+the Ecma TC52 [external contributer form][] and submit it to Ecma.
 
-[tex]: http://www.latex-project.org/
-[language spec]: https://www.dartlang.org/docs/spec/
 [dart standard]: http://www.ecma-international.org/publications/standards/Ecma-408.htm
 [rfpp]: http://www.ecma-international.org/memento/TC52%20policy/Ecma%20Experimental%20TC52%20Royalty-Free%20Patent%20Policy.pdf
 [external contributer form]: http://www.ecma-international.org/memento/TC52%20policy/Contribution%20form%20to%20TC52%20Royalty%20Free%20Task%20Group%20as%20a%20non-member.pdf
