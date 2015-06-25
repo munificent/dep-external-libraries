@@ -583,32 +583,35 @@ canonical library C ("canonical") and an external library E ("external"), here
 is what we do:
 
 1.  For every top-level `external` function in C:
-    1.  If a top-level function in E with the same name exists:
-        1.  If the name does not refer to a function, or the function's type
-            could not be a valid override for the type of the function in C,
-            warn.
-        2.  Replace the function in C with one that forwards to the function in
-            E.
+    1.  If a top-level function (including getters and setters) in E with the
+        same name exists:
+        1.  If the name does not refer to a function, or the function's type is
+            not exactly the same as the type of the function in C, fail with a
+            compile error.
+        2.  Otherwise, replace the function in C with one that forwards to the
+            function in E.
     2.  Else:
         1.  Do nothing. (This falls back to the existing behavior to let the
             platform inject an implementation.)
 2.  For every class T ("type") in C where there is a class P ("patch") in E
-    with the same name :
+    with the same name:
     1.  For every `external` member in T:
         1.  If a member with that name exists in P:
-            2.  If P's member could not be a valid override for T's, warn.
+            2.  If the type of P's member is not exactly the same as T's, fail
+                with a compile error.
             3.  Replace the member in T with the member in P. The body of the
                 member retains its original lexical scope in E, but resolves
-                `this` to be an instance of T.
+                `this` to be an instance of T. Likewise, `super` usage resolves
+                to the superclass of T.
         2.  Else:
             1.  Do nothing. (This falls back to the existing behavior to let
                 the platform inject an implementation.)
-        3.  Otherwise, the member in P is added to M.
     2.  For every non-abstract member in P that we have not already handled:
-        1.  If a member with that name exists in T, warn.
-        2.  Add the member to T. The body of the member retains its original
-            lexical scope in E, but resolves `this` to be an instance of T.
-    3.  Replace P in E with T.
+        1.  If a member with that name exists in T, fail with a compile error.
+        2.  Otherwise, add the member to T. The body of the member retains its
+            original lexical scope in E, but resolves `this` to be an instance
+            of T. Likewise, `super` usage resolves to the superclass of T.
+    3.  Replace P and all references to P in E with T.
 
 ### Static analysis of libraries containing `external`
 
@@ -729,9 +732,6 @@ user to select which configuration they are currently looking at.
 *   Does an external library have to annotate which classes and methods are
     patching things in the canonical library, or is name matching enough to
     indicate that?
-
-*   How strict should we be about matching signatures for external functions
-    and their implementations? Use override semantics? Exact match?
 
 *   How strict should we be about member collisions in a patched class? An
     error? Warning? If a warning, what are the runtime semantics?
