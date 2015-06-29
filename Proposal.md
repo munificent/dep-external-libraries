@@ -119,7 +119,7 @@ causes user pain and usually breaks the code generator. However, we'd really
 like the serialization API to hang off the hand-authored class. Given:
 
 ```dart
-class Person extends {
+class Person {
   final String name;
   final int age;
 
@@ -142,7 +142,7 @@ hand-authored library but *implemented* in another file? Like so:
 ```dart
 external library 'person.g.dart';
 
-class Person extends {
+class Person {
   final String name;
   final int age;
 
