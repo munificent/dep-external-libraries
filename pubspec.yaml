@@ -1,0 +1,11 @@
+name: dep_external_libraries
+dependencies:
+  analyzer: "^0.26.0"
+  barback: "^0.15.2"
+  dart_style: "^0.2.0"
+  path: "^1.0.0"
+dev_dependencies:
+  test: "^0.12.3+9"
+transformers:
+- $dart2js:
+    $exclude: example
