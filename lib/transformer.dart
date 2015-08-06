@@ -11,53 +11,66 @@ import 'package:barback/barback.dart';
 import 'package:dart_style/dart_style.dart';
 import 'package:path/path.dart' as p;
 
-import 'src/canonical_visitor.dart';
+import 'src/patcher.dart';
 import 'src/to_source_visitor.dart';
 
 final _externalImportPattern =
     new RegExp(r'//external:\s*"([^"]+)"(\s+if\s+(.+))?');
 
-// TODO(rnystrom): Make lazy.
-class ExternalizeTransformer extends Transformer {
-  ExternalizeTransformer.asPlugin();
+// TODO(rnystrom): An incomplete list of things left to implement:
+//
+// - calling an unpatched external
+// - patching private stuff
+// - patching a getter with a field
+// - disallow patching non-external methods
+// - disallow patching non-external functions
+// - nested external function
+// - top level getter, setter
+// - external class cannot specify superclass (superinterfaces? mixins?)
+// - configuration
+// - fields
 
-  String get allowedExtensions => ".e.dart";
+// TODO(rnystrom): Make lazy.
+class ExternalLibraryTransformer extends Transformer {
+  ExternalLibraryTransformer.asPlugin();
+
+  String get allowedExtensions => ".dart";
 
   Future apply(Transform transform) async {
     var source = await transform.primaryInput.readAsString();
 
     // TODO(rnystrom): Handle errors.
-    var unit = parseCompilationUnit(source,
+    var canonical = parseCompilationUnit(source,
         name: transform.primaryInput.id.toString());
 
-    var externalUri;
-    var externalUnit;
+    var externalUri = _parseExternalImports(canonical);
 
-    if (unit.directives.isNotEmpty &&
-        unit.directives.first is LibraryDirective) {
-      externalUri = _parseExternalImports(unit.directives.first);
+    // If the library doesn't have any external libraries, bail.
+    if (externalUri == null) return;
 
-      if (externalUri != null) {
-        externalUnit = await _readExternalLibrary(transform, externalUri);
-      }
+    var externalUnit = await _readExternalLibrary(transform, externalUri);
+
+    var canonicalUri = _pathToCanonical(transform.primaryInput.id, externalUri);
+    var patcher = new Patcher(
+        canonicalUri, canonical, externalUri, externalUnit);
+    patcher.apply();
+
+    _outputUnit(transform, canonical, transform.primaryInput.id);
+
+    // Output the modified external library too.
+    if (externalUnit != null) {
+      var externalId = _uriToId(transform.primaryInput.id, externalUri);
+      _outputUnit(transform, externalUnit, externalId);
     }
-
-    var visitor = new CanonicalVisitor(externalUri, externalUnit);
-    unit.accept(visitor);
-
-    var writer = new PrintStringWriter();
-    var toSourceVisitor = new ToSourceVisitorCopy(writer);
-    unit.accept(toSourceVisitor);
-
-    var output = writer.toString();
-    output = new DartFormatter().format(output);
-
-    transform.addOutput(
-        new Asset.fromString(transform.primaryInput.id, output));
   }
 
-  String _parseExternalImports(LibraryDirective node) {
-    for (var comment = node.beginToken.precedingComments;
+  String _parseExternalImports(CompilationUnit unit) {
+    if (unit.directives.isEmpty) return null;
+    if (unit.directives.first is! LibraryDirective) return null;
+
+    var libraryDirective = unit.directives.first as LibraryDirective;
+
+    for (var comment = libraryDirective.beginToken.precedingComments;
         comment != null;
         comment = comment.next) {
       var match = _externalImportPattern.firstMatch(comment.lexeme);
@@ -75,14 +88,41 @@ class ExternalizeTransformer extends Transformer {
 
   Future<CompilationUnit> _readExternalLibrary(
       Transform transform, String externalUri) async {
-    var canonicalDir = p.url.dirname(transform.primaryInput.id.path);
-    var externalPath = p.url.join(canonicalDir, externalUri);
-    var externalId =
-    new AssetId(transform.primaryInput.id.package, externalPath);
-
+    var externalId = _uriToId(transform.primaryInput.id, externalUri);
     var externalSource = await transform.readInputAsString(externalId);
 
     // TODO(rnystrom): Handle errors.
     return parseCompilationUnit(externalSource, name: externalUri);
+  }
+
+  /// Given the [canonicalId] and (likely relative) URI from it to the
+  /// external library, returns a relative URI pointing back from the
+  /// [externalUri] to the canonical one.
+  String _pathToCanonical(AssetId canonicalId, String externalUri) {
+    var relativeDir = p.url.relative(p.url.dirname(canonicalId.path),
+        from: p.url.dirname(externalUri));
+
+    return p.url.normalize(
+        p.url.join(relativeDir, p.url.basename(canonicalId.path)));
+  }
+
+  /// Creates an AssetId from a [uri] relative to [base].
+  AssetId _uriToId(AssetId base, String uri) {
+    var canonicalDir = p.url.dirname(base.path);
+    var externalPath = p.url.join(canonicalDir, uri);
+    return new AssetId(base.package, externalPath);
+  }
+
+  /// Writes [unit] to an output with [id].
+  void _outputUnit(Transform transform, CompilationUnit unit, AssetId id) {
+
+    var writer = new PrintStringWriter();
+    var toSourceVisitor = new ToSourceVisitorCopy(writer);
+    unit.accept(toSourceVisitor);
+
+    var output = writer.toString();
+    output = new DartFormatter().format(output);
+
+    transform.addOutput(new Asset.fromString(id, output));
   }
 }

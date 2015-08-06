@@ -10,14 +10,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:mirrors';
 
-import 'package:analyzer/analyzer.dart';
 import 'package:barback/barback.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
 import 'package:dep_external_libraries/transformer.dart';
 
-final _expectComment = new RegExp("// expect: (.+)");
+final RegExp _expectComment = new RegExp("// expect: (.+)");
 
 /// Locate the "test" directory.
 ///
@@ -33,51 +32,43 @@ Future main() async {
 
   var tempDir;
   setUp(() {
-    tempDir = new Directory(testDirectory).createTempSync("temp-");
-
-    // Copy the external libraries over to the build output directory so that
-    // the relative imports work.
-    for (var entry in new Directory(casesDir).listSync()) {
-      if (!entry.path.endsWith(".dart")) continue;
-
-      // Don't copy canonical libraries.
-      if (entry.path.endsWith(".e.dart")) continue;
-
-      var name = p.relative(entry.path, from: casesDir);
-      var source = (entry as File).readAsStringSync();
-      new File(p.join(tempDir.path, name)).writeAsStringSync(source);
-    }
+    tempDir = new Directory(p.join(testDirectory, "out"));
+    tempDir.createSync();
   });
 
   // Transform each canonical library and run it.
-  var transformer = new ExternalizeTransformer.asPlugin();
+  var transformer = new ExternalLibraryTransformer.asPlugin();
 
   for (var entry in new Directory(casesDir).listSync()) {
-    if (!entry.path.endsWith(".e.dart")) continue;
+    if (!entry.path.endsWith(".dart")) continue;
+    if (entry.path.endsWith("_external.dart")) continue;
 
-    test(entry.path, () async {
+    var description = p.relative(entry.path, from: casesDir);
+    test(description, () async {
       // Read the test case canonical library.
       var name = p.relative(entry.path, from: casesDir);
       var primary = testCaseAsset(name);
 
-      // Parse the expectation from it.
+      // Parse the expectations from it.
       var input = (entry as File).readAsStringSync();
-      var match = _expectComment.firstMatch(input);
-      assert(match != null);
+      var matches = _expectComment.allMatches(input);
+      assert(matches != null);
 
-      var expectation = match[1];
+      var expectation = matches.map((match) => match[1]).join("\n");
 
       // Run the transformer on it.
       var transform = new _TestTransform(primary);
       await transformer.apply(transform);
-      var output = await transform.output;
 
-      var outPath = p.join(tempDir.path, name);
-      new File(outPath).writeAsStringSync(output);
+      for (var asset in transform.outputs) {
+        var output = await asset.readAsString();
+        var outPath = p.join(tempDir.path, p.fromUri(asset.id.path));
+        new File(outPath).writeAsStringSync(output);
+      }
 
       var result = Process.runSync(Platform.resolvedExecutable, [
         "--checked",
-        outPath
+        p.join(tempDir.path, name)
       ]);
 
       expect(result.stderr.trim(), equals(""));
@@ -91,16 +82,16 @@ Future main() async {
 }
 
 Asset testCaseAsset(String name) {
-  var id = new AssetId("externalize", name);
+  var id = new AssetId("test", name);
   return new Asset.fromPath(id, p.join(testDirectory, "cases", name));
 }
 
 class _TestTransform implements Transform {
   final Asset primaryInput;
 
-  /// After the transformer has run, this will be a future that completes to
-  /// the contents of the one output asset.
-  Future<String> output;
+  /// After the transformer has run, this will be set of assets that were
+  /// output.
+  final Set<Asset> outputs = new Set();
 
   TransformLogger get logger => throw new UnsupportedError("Not supported.");
 
@@ -120,10 +111,7 @@ class _TestTransform implements Transform {
       throw new UnsupportedError("Not supported.");
 
   void addOutput(Asset asset) {
-    // Should only produce one output.
-    assert(output == null);
-
-    output = asset.readAsString();
+    outputs.add(asset);
   }
 
   void consumePrimary() => throw new UnsupportedError("Not supported.");
