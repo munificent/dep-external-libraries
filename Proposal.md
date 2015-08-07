@@ -565,10 +565,11 @@ library pair to merge.
 The basic concepts are:
 
  *  Both the canonical and external libraries retain their original lexical
-    scopes. Functions and members in each of those libraries are always
-    resolved in the lexical scope in which they appear.
+    scopes. Code in each of those libraries is always resolved in the lexical
+    scope in which they appear. (By "lexical scope", I any use of a name that
+    does *not* resolve to a method call on an implicit `this`.)
 
- *  For each patched class, *single* class is produced that contains the
+ *  For each patched class, a *single* class is produced that contains the
     members of both the canonical and external library and that class is bound
     to its name in both libraries' namespaces. Explicit and implicit references
     to `this` in members of that class always refer to this merged class.
@@ -595,7 +596,9 @@ is what we do:
             platform inject an implementation.)
 2.  For every class T ("type") in C where there is a class P ("patch") in E
     with the same name:
-    1.  For every `external` member in T:
+    1.  If P declares any superclass, mixins, or superinterfaces, fail with a
+        compile error.
+    2.  For every `external` member in T:
         1.  If a member with that name exists in P:
             2.  If the type of P's member is not exactly the same as T's, fail
                 with a compile error.
@@ -606,12 +609,30 @@ is what we do:
         2.  Else:
             1.  Do nothing. (This falls back to the existing behavior to let
                 the platform inject an implementation.)
-    2.  For every non-abstract member in P that we have not already handled:
-        1.  If a member with that name exists in T, fail with a compile error.
+    3.  For every non-abstract member in P that we have not already handled:
+        1.  If the member is public, fail with a compile error.
         2.  Otherwise, add the member to T. The body of the member retains its
             original lexical scope in E, but resolves `this` to be an instance
-            of T. Likewise, `super` usage resolves to the superclass of T.
+            of T.
     3.  Replace P and all references to P in E with T.
+
+By "same type", we mean that given two types A and B:
+
+1.  If A and B are both type names, they are the same type if and only if:
+    1.  The named types resolve to the same declaration or one resolves to a
+        canonical class and the other resolves to its matching external class.
+    2.  Their type argument lists have the same arity.
+    3.  Each pair of type arguments in A and B are the same type.
+2.  If A and B are both function types, they are the same type if and only if:
+    1.  Their return type is the same type.
+    2.  They have the same number of required and optional positional
+        parameters
+    3.  They have the same set of named parameters.
+    4.  The types of all of their pairs of parameters are the same type.
+
+These rules are deliberately much tighter (but also simpler) than the rules for
+subtyping. They ensure that an external member is exactly type-identical with
+the canonical declaration it is filling in.
 
 ### Static analysis of libraries containing `external`
 
